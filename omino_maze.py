@@ -481,20 +481,16 @@ def random_feasible_selection(
     return chosen, occ
 
 
-def neighbor_move(
-    chosen: List[int],
-    occ: int,
-    placements: List[Dict[str, Any]],
-    max_pieces: int,
-    no_repeat: bool,
-    rng,
-) -> Tuple[List[int], int]:
+def neighbor_move(chosen, occ, used_shapes, placements, max_pieces, no_repeat, rng):
+    """
+    Agora used_shapes é passado como parâmetro e atualizado incrementalmente.
+    Economiza O(P) operações por iteração.
+    """
     N = len(placements)
     choice = rng.random()
     chosen_set = set(chosen)
-    used_shapes = 0
-    for i in chosen:
-        used_shapes |= 1 << placements[i]["shape_id"]
+    
+    # ADD MOVE
     if choice < 0.35 and len(chosen) < max_pieces:
         pool = list(range(N))
         rng.shuffle(pool)
@@ -509,16 +505,26 @@ def neighbor_move(
                 continue
             new_chosen = chosen + [i]
             new_occ = occ | pl["mask"]
-            return new_chosen, new_occ
+            new_used = used_shapes | (1 << sid)  # ← atualização incremental
+            return new_chosen, new_occ, new_used
+    
+    # REMOVE MOVE
     if choice < 0.7 and len(chosen) > 0:
         rem = rng.choice(chosen)
+        rem_sid = placements[rem]["shape_id"]
         new_chosen = [c for c in chosen if c != rem]
         new_occ = 0
+        new_used = 0
+        # Reconstruir (inevitável na remoção)
         for c in new_chosen:
             new_occ |= placements[c]["mask"]
-        return new_chosen, new_occ
+            new_used |= 1 << placements[c]["shape_id"]
+        return new_chosen, new_occ, new_used
+    
+    # SWAP MOVE
     if len(chosen) > 0:
         rem = rng.choice(chosen)
+        rem_sid = placements[rem]["shape_id"]
         pool = list(range(N))
         rng.shuffle(pool)
         new_chosen = [c for c in chosen if c != rem]
@@ -538,17 +544,11 @@ def neighbor_move(
                 continue
             new_chosen2 = new_chosen + [i]
             new_occ2 = occ_tmp | pl["mask"]
-            return new_chosen2, new_occ2
-    if len(chosen) > 0:
-        rem = rng.choice(chosen)
-        new_chosen = [c for c in chosen if c != rem]
-        new_occ = 0
-        for c in new_chosen:
-            new_occ |= placements[c]["mask"]
-        return new_chosen, new_occ
-    return chosen, occ
-
-
+            new_used2 = used_tmp | (1 << sid)
+            return new_chosen2, new_occ2, new_used2
+    
+    # Fallback
+    return chosen, occ, used_shapes
 # ---------------------- rendering (palette cached) ----------------------
 _palette_cache = {}
 
@@ -797,15 +797,25 @@ def optimize_maze(
     current_sel = best_sel.copy() if best_sel else []
     current_occ = best_occ
     current_score = best_score
+    
+    current_used = 0
+    for i in current_sel:
+        current_used |= 1 << placements[i]["shape_id"]
 
     T0 = 1.0
     Tmin = 0.001
     step = 0
+    
+    # Parâmetros de early stopping
+    no_improve_steps = 0
+    max_no_improve = 10000  # parar se 10000 iterações sem melhoria
+    last_best_step = 0
 
     while perf_counter() - start_time < time_limit:
         step += 1
-        sel2, occ2 = neighbor_move(
-            current_sel.copy(), current_occ, placements, max_pieces, no_repeat, rng
+        sel2, occ2, used2 = neighbor_move(
+            current_sel.copy(), current_occ, current_used,
+            placements, max_pieces, no_repeat, rng
         )
         sc2, _, _, path2 = score_selection(occ2, w, h)
         accept = False
@@ -829,16 +839,16 @@ def optimize_maze(
             current_sel = sel2
             current_occ = occ2
             current_score = sc2
+            current_used = used2
 
             if sc2 > best_score:
                 best_score = sc2
                 best_sel = sel2.copy()
                 best_occ = occ2
                 best_path = path2
-                tnow = perf_counter()
-                print(
-                    f"[{step}] New best: diameter={best_score}, pieces={len(best_sel)} (t={tnow-start_time:.1f}s)"
-                )
+                last_best_step = step
+                no_improve_steps = 0  # reset
+                print(f"[{step}] New best: diameter={best_score}, pieces={len(best_sel)}")
                 try:
                     render_maze_and_path_by_shape(
                         placements, best_sel, w, h, best_path, out_file=out, cell=cell
@@ -846,6 +856,14 @@ def optimize_maze(
                 # trunk-ignore(bandit/B110)
                 except Exception:
                     pass
+            else:
+                no_improve_steps = step - last_best_step
+        else:
+            no_improve_steps = step - last_best_step
+        
+        if no_improve_steps >= max_no_improve:
+            print(f"[early stop] no improvement in {no_improve_steps} steps")
+            break
     print(
         f"[done] elapsed={perf_counter()-start_time:.1f}s steps={step} best_score={best_score} pieces={0 if not best_sel else len(best_sel)}"
     )
