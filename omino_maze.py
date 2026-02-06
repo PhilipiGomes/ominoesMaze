@@ -27,21 +27,23 @@ _ROTATIONS = (
 def _normalize_variants(cells: Set[Tuple[int, int]]) -> List[Tuple[int, int]]:
     """Gera todas as variantes (reflexões+rotações) normalizadas sem loops extras."""
     pts = tuple(cells)
+    k = len(pts)
     variants = []
     for reflect in (False, True):
         for rot_fn in _ROTATIONS:
-            transformed = []
+            # Pré-alocar lista com tamanho k (micro-otimização)
+            transformed = [None] * k
             if reflect:
                 # aplicar reflexão em x antes da rotação
-                for x, y in pts:
+                for idx, (x, y) in enumerate(pts):
                     xr = -x
                     yr = y
                     tx, ty = rot_fn(xr, yr)
-                    transformed.append((tx, ty))
+                    transformed[idx] = (tx, ty)
             else:
-                for x, y in pts:
+                for idx, (x, y) in enumerate(pts):
                     tx, ty = rot_fn(x, y)
-                    transformed.append((tx, ty))
+                    transformed[idx] = (tx, ty)
             minx = min(p[0] for p in transformed)
             miny = min(p[1] for p in transformed)
             norm = tuple(sorted(((p[0] - minx, p[1] - miny) for p in transformed)))
@@ -115,17 +117,20 @@ def all_symmetries(
     """
     Gera todas as simetrias (reflexões+rotações) normalizadas de `canonical`.
     Minimiza alocações: calcula minx/miny on-the-fly e evita chamadas de função por ponto.
+    OTIMIZADO: pré-alocação de listas.
     """
     pts = canonical
+    k = len(pts)
     syms = set()
     for reflect in (False, True):
         for rot in range(4):
-            transformed = []
+            # Pré-alocar lista com tamanho k
+            transformed = [None] * k
             # init with large/small sentinels
             minx = 10**9
             miny = 10**9
             if reflect:
-                for x, y in pts:
+                for idx, (x, y) in enumerate(pts):
                     x = -x
                     if rot == 0:
                         tx, ty = x, y
@@ -135,13 +140,13 @@ def all_symmetries(
                         tx, ty = -x, -y
                     else:
                         tx, ty = y, -x
-                    transformed.append((tx, ty))
+                    transformed[idx] = (tx, ty)
                     if tx < minx:
                         minx = tx
                     if ty < miny:
                         miny = ty
             else:
-                for x, y in pts:
+                for idx, (x, y) in enumerate(pts):
                     if rot == 0:
                         tx, ty = x, y
                     elif rot == 1:
@@ -150,7 +155,7 @@ def all_symmetries(
                         tx, ty = -x, -y
                     else:
                         tx, ty = y, -x
-                    transformed.append((tx, ty))
+                    transformed[idx] = (tx, ty)
                     if tx < minx:
                         minx = tx
                     if ty < miny:
@@ -170,6 +175,7 @@ def placements_for_shape(
       - usa base_mask (bits relativos) e desloca com << offset em vez de calcular 1<<(idx) por célula.
       - evita construir 'cells' até confirmar máscara única.
       - usa variáveis locais para reduzir lookup.
+      - NOVO: pré-filtra simetrias que claramente não cabem
     """
     # ensure we pass a tuple-of-tuples (canonical) to all_symmetries
     if isinstance(shape, set):
@@ -177,8 +183,11 @@ def placements_for_shape(
     else:
         canonical = tuple(shape)
     syms = all_symmetries(canonical)
+    
+    # OTIMIZAÇÃO: Pré-filtrar simetrias que não cabem no tabuleiro
     syms_filtered = [s for s in syms 
-                    if max(x for x,_ in s) < w and max(y for _,y in s) < h]
+                    if max(x for x, _ in s) < w and max(y for _, y in s) < h]
+    
     placements = []
     seen_masks = set()
     app = placements.append
@@ -282,7 +291,22 @@ def reconstruct_path_local(
     return [local_to_global[i] for i in path_local]
 
 
-EXACT_THRESHOLD = 120
+# OTIMIZAÇÃO: Threshold adaptativo baseado no tamanho do grid
+def get_adaptive_threshold(w: int, h: int) -> int:
+    """
+    Retorna threshold adaptativo baseado no tamanho do grid.
+    Grids maiores → threshold menor para economizar memória/tempo.
+    """
+    total = w * h
+    if total <= 50:
+        return 120  # all-pairs BFS até 120 células
+    elif total <= 100:
+        return 80
+    elif total <= 200:
+        return 50
+    else:
+        return 30  # grids muito grandes: heurística mais agressiva
+
 
 # tamanho do LRU (ajustável)
 _LRU_CACHE_SIZE = 10**15
@@ -359,7 +383,10 @@ def _compute_diameter_and_path_uncached(
                 if gg_local != -1:
                     local_nb[i].append(gg_local)
 
-        if comp_size <= EXACT_THRESHOLD:
+        # OTIMIZAÇÃO: usar threshold adaptativo
+        threshold = get_adaptive_threshold(w, h)
+
+        if comp_size <= threshold:
             # exact all-pairs BFS in grafo local
             for src_local in range(comp_size):
                 dist, parent = bfs_local(src_local, local_nb)
@@ -481,9 +508,18 @@ def random_feasible_selection(
     return chosen, occ
 
 
-def neighbor_move(chosen, occ, used_shapes, placements, max_pieces, no_repeat, rng):
+# OTIMIZAÇÃO: neighbor_move agora recebe e retorna used_shapes
+def neighbor_move(
+    chosen: List[int],
+    occ: int,
+    used_shapes: int,
+    placements: List[Dict[str, Any]],
+    max_pieces: int,
+    no_repeat: bool,
+    rng,
+) -> Tuple[List[int], int, int]:
     """
-    Agora used_shapes é passado como parâmetro e atualizado incrementalmente.
+    OTIMIZADO: used_shapes é passado como parâmetro e atualizado incrementalmente.
     Economiza O(P) operações por iteração.
     """
     N = len(placements)
@@ -511,7 +547,6 @@ def neighbor_move(chosen, occ, used_shapes, placements, max_pieces, no_repeat, r
     # REMOVE MOVE
     if choice < 0.7 and len(chosen) > 0:
         rem = rng.choice(chosen)
-        rem_sid = placements[rem]["shape_id"]
         new_chosen = [c for c in chosen if c != rem]
         new_occ = 0
         new_used = 0
@@ -524,7 +559,6 @@ def neighbor_move(chosen, occ, used_shapes, placements, max_pieces, no_repeat, r
     # SWAP MOVE
     if len(chosen) > 0:
         rem = rng.choice(chosen)
-        rem_sid = placements[rem]["shape_id"]
         pool = list(range(N))
         rng.shuffle(pool)
         new_chosen = [c for c in chosen if c != rem]
@@ -548,7 +582,19 @@ def neighbor_move(chosen, occ, used_shapes, placements, max_pieces, no_repeat, r
             return new_chosen2, new_occ2, new_used2
     
     # Fallback
+    if len(chosen) > 0:
+        rem = rng.choice(chosen)
+        new_chosen = [c for c in chosen if c != rem]
+        new_occ = 0
+        new_used = 0
+        for c in new_chosen:
+            new_occ |= placements[c]["mask"]
+            new_used |= 1 << placements[c]["shape_id"]
+        return new_chosen, new_occ, new_used
+    
     return chosen, occ, used_shapes
+
+
 # ---------------------- rendering (palette cached) ----------------------
 _palette_cache = {}
 
@@ -687,7 +733,7 @@ def render_maze_and_path_by_shape(
             raise
 
 
-# ---------------------- heuristic optimizer (unchanged API, prints included) ----------------------
+# ---------------------- heuristic optimizer (OTIMIZADO) ----------------------
 def optimize_maze(
     placements: List[Dict[str, Any]],
     w: int,
@@ -701,6 +747,7 @@ def optimize_maze(
     out: str = "best.png",
     cell: int = 30,
     first_greedy: int = 100,
+    max_no_improve: int = 10000,
 ) -> Tuple[int, List[int], int, List[int]]:
     if time_limit is None:
         time_limit = float("inf")
@@ -798,6 +845,7 @@ def optimize_maze(
     current_occ = best_occ
     current_score = best_score
     
+    # OTIMIZAÇÃO: manter used_shapes como estado persistente
     current_used = 0
     for i in current_sel:
         current_used |= 1 << placements[i]["shape_id"]
@@ -806,13 +854,13 @@ def optimize_maze(
     Tmin = 0.001
     step = 0
     
-    # Parâmetros de early stopping
+    # OTIMIZAÇÃO: Parâmetros de early stopping
     no_improve_steps = 0
-    max_no_improve = 10000  # parar se 10000 iterações sem melhoria
     last_best_step = 0
 
     while perf_counter() - start_time < time_limit:
         step += 1
+        # OTIMIZADO: passar e receber used_shapes
         sel2, occ2, used2 = neighbor_move(
             current_sel.copy(), current_occ, current_used,
             placements, max_pieces, no_repeat, rng
@@ -839,7 +887,7 @@ def optimize_maze(
             current_sel = sel2
             current_occ = occ2
             current_score = sc2
-            current_used = used2
+            current_used = used2  # OTIMIZADO: manter estado
 
             if sc2 > best_score:
                 best_score = sc2
@@ -848,7 +896,10 @@ def optimize_maze(
                 best_path = path2
                 last_best_step = step
                 no_improve_steps = 0  # reset
-                print(f"[{step}] New best: diameter={best_score}, pieces={len(best_sel)}")
+                tnow = perf_counter()
+                print(
+                    f"[{step}] New best: diameter={best_score}, pieces={len(best_sel)} (t={tnow-start_time:.1f}s)"
+                )
                 try:
                     render_maze_and_path_by_shape(
                         placements, best_sel, w, h, best_path, out_file=out, cell=cell
@@ -861,16 +912,18 @@ def optimize_maze(
         else:
             no_improve_steps = step - last_best_step
         
+        # OTIMIZAÇÃO: Early stopping
         if no_improve_steps >= max_no_improve:
             print(f"[early stop] no improvement in {no_improve_steps} steps")
             break
+            
     print(
         f"[done] elapsed={perf_counter()-start_time:.1f}s steps={step} best_score={best_score} pieces={0 if not best_sel else len(best_sel)}"
     )
     return best_score, best_sel, best_occ, best_path
 
 
-# ---------------------- brute-force search (with canonical pruning) ----------------------
+# ---------------------- brute-force search (OTIMIZADO com memoization) ----------------------
 def bruteforce_search(
     placements: List[Dict[str, Any]],
     w: int,
@@ -975,10 +1028,14 @@ def bruteforce_search(
                 best = res
         return best if best is not None else mask
 
-    # ---------- DFS with canonical-pruning and upper-bound pruning ----------
+    # ---------- DFS with canonical-pruning, upper-bound pruning, and MEMOIZATION ----------
     nodes_visited = 0
     time_up = False
     seen_canons = set()
+    
+    # OTIMIZAÇÃO: Memoization de estados
+    state_memo = {}
+    pruned_by_memo = 0
 
     # local bindings for speed in inner loop
     masks_local = masks
@@ -988,7 +1045,8 @@ def bruteforce_search(
     perf = perf_counter
 
     def dfs(i, sel, occ, used_shapes):
-        nonlocal best_score, best_sel, best_occ, best_path, nodes_visited, time_up
+        nonlocal best_score, best_sel, best_occ, best_path, nodes_visited
+        nonlocal time_up, pruned_by_memo
 
         # inline time check (cheap)
         if perf() - start_time > time_limit:
@@ -996,9 +1054,26 @@ def bruteforce_search(
             return
 
         nodes_visited += 1
+        
+        # OTIMIZAÇÃO: Memoization check
+        canon = canonical_mask_cached(occ)
+        n_pieces = len(sel)
+        state_key = (canon, n_pieces)
+        
+        if state_key in state_memo:
+            # Se já exploramos esse estado com mesmo número de peças
+            # e não achamos nada melhor que o atual best, podar
+            if state_memo[state_key] <= best_score:
+                pruned_by_memo += 1
+                return
 
         # Evaluate current subset
         score, _, _, path = score_selection(occ, w, h)
+        
+        # OTIMIZAÇÃO: Atualizar memo
+        if state_key not in state_memo or state_memo[state_key] < score:
+            state_memo[state_key] = score
+        
         if score > best_score:
             best_score = score
             best_sel = sel.copy()
@@ -1006,7 +1081,8 @@ def bruteforce_search(
             best_path = path
             # log + optional render (kept)
             print(
-                f"[brute] new best score={best_score} pieces={len(best_sel)}, nodes={nodes_visited} (t={perf()-start_time:.2f}s)"
+                f"[brute] new best score={best_score} pieces={len(best_sel)}, nodes={nodes_visited}, "
+                f"memo_prunes={pruned_by_memo} (t={perf()-start_time:.2f}s)"
             )
             try:
                 render_maze_and_path_by_shape(
@@ -1027,7 +1103,6 @@ def bruteforce_search(
             return
 
         # canonical pruning: only expand canonical occupancy once
-        canon = canonical_mask_cached(occ)
         if canon in seen_canons:
             return
         seen_canons.add(canon)
@@ -1055,14 +1130,17 @@ def bruteforce_search(
 
     # start DFS
     print(
-        f"[brute] start exhaustive search: placements={N} max_pieces={max_pieces} time_limit={time_limit if time_limit!=float('inf') else 'Infinity'} s"
+        f"[brute] starting exhaustive search with memoization: placements={N} max_pieces={max_pieces} "
+        f"time_limit={time_limit if time_limit!=float('inf') else 'Infinity'} s"
     )
     dfs(0, [], 0, 0)
 
     if time_up:
         print("[brute] stopped because time limit reached")
     print(
-        f"[brute] finished best_score={best_score}, pieces={len(best_sel)} elapsed={perf()-start_time:.2f}s nodes_visited={nodes_visited}"
+        f"[brute] finished best_score={best_score}, pieces={len(best_sel)} "
+        f"elapsed={perf()-start_time:.2f}s nodes_visited={nodes_visited} "
+        f"total_memo_prunes={pruned_by_memo}"
     )
     return best_score, best_sel, best_occ, best_path
 
@@ -1082,6 +1160,7 @@ def main() -> None:
     p.add_argument("--first-greedy", type=int, default=100)
     p.add_argument("--init-pos", type=int, default=None)
     p.add_argument("--init-selection", type=str, default=None)
+    p.add_argument("--max-no-improve", type=int, default=10000)
     # brute-force control
     p.add_argument("--bruteforce", action="store_true", help="force exhaustive bruteforce")
     args = p.parse_args()
@@ -1121,7 +1200,7 @@ def main() -> None:
     allow_bruteforce = args.bruteforce
 
     if allow_bruteforce:
-        print("[mode] using exhaustive bruteforce search")
+        print("[mode] using exhaustive bruteforce search (OPTIMIZED)")
         best_score, best_sel, _, best_path = bruteforce_search(
             placements,
             args.w,
@@ -1133,7 +1212,7 @@ def main() -> None:
             cell=args.cell,
         )
     else:
-        print("[mode] using heuristic optimize_maze")
+        print("[mode] using heuristic optimize_maze (OPTIMIZED)")
         best_score, best_sel, _, best_path = optimize_maze(
             placements,
             args.w,
@@ -1147,6 +1226,7 @@ def main() -> None:
             out=args.out,
             cell=args.cell,
             first_greedy=args.first_greedy,
+            max_no_improve=args.max_no_improve,
         )
 
     print(
