@@ -889,9 +889,9 @@ def optimize_maze_parallel(
         time_limit = float("inf")
 
     if n_workers is None:
-        n_workers = cpu_count()
+        n_workers = cpu_count() - 2
 
-    n_workers = max(1, min(n_workers, cpu_count()))  # Limitar ao número de CPUs
+    n_workers = max(1, min(n_workers, cpu_count() - 2))  # Limitar ao número de CPUs
 
     print(f"[parallel optimize] Using {n_workers} workers, time_limit={time_limit}s")
 
@@ -1352,9 +1352,9 @@ def bruteforce_search_parallel(
         time_limit = float("inf")
 
     if n_workers is None:
-        n_workers = cpu_count()
+        n_workers = cpu_count() - 2
 
-    n_workers = max(1, min(n_workers, cpu_count()))
+    n_workers = max(1, min(n_workers, cpu_count() - 2))
 
     start_time = perf_counter()
 
