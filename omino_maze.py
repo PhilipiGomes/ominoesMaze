@@ -786,6 +786,8 @@ def _optimize_worker(args):
         local_best_path = []
         local_best_score = 0
 
+    print(f"[worker {worker_id}] initial greedy score: {local_best_score} with {len(local_best_sel)} pieces (t={perf_counter()-start_time:.1f}s)")
+
     current_sel = local_best_sel.copy() if local_best_sel else []
     current_occ = local_best_occ
     current_score = local_best_score
@@ -840,6 +842,16 @@ def _optimize_worker(args):
                 local_best_path = path2
                 last_best_step = step
                 no_improve_steps = 0
+                if sc2 > shared_best_score.value:
+                    shared_best_score.value = sc2
+                    print(f"[worker {worker_id}] new global best score: {sc2} with {len(sel2)} pieces (t={perf_counter()-start_time:.1f}s)")
+                    try:
+                        render_maze_and_path_by_shape(
+                            placements, local_best_sel, w, h, local_best_path, out_file="Imgs/out.png", cell=28
+                        )
+                    # trunk-ignore(bandit/B110)
+                    except Exception:
+                        pass
             else:
                 no_improve_steps = step - last_best_step
         else:
@@ -949,7 +961,7 @@ def optimize_maze_parallel(
 
     # Encontrar o melhor resultado
     best_result = max(results, key=lambda x: x[1])  # x[1] é o score
-    worker_id, best_score, best_sel, best_occ, best_path, steps = best_result
+    worker_id, best_score, best_sel, best_occ, best_path, _ = best_result
 
     elapsed = perf_counter() - start_time
     total_steps = sum(r[5] for r in results)
@@ -1263,6 +1275,14 @@ def _bruteforce_worker(args):
             with shared_lock:
                 if score > shared_best_score.value:
                     shared_best_score.value = score
+                    print(f'[worker {worker_id}] new global best score: {score} with {len(sel)} pieces (t={perf_counter()-start_time:.1f}s)')
+                    try:
+                        render_maze_and_path_by_shape(
+                            placements, local_best_sel, w, h, local_best_path, out_file="Imgs/out.png", cell=28
+                        )
+                    # trunk-ignore(bandit/B110)
+                    except Exception:
+                        pass
 
         # Upper bound prune
         blocked = occ.bit_count()
@@ -1822,6 +1842,9 @@ def main() -> None:
                 out=args.out,
                 cell=args.cell,
                 first_greedy=args.first_greedy,
+                max_no_improve=(
+                    args.max_no_improve if args.max_no_improve > 0 else float("inf")
+                ),
             )
 
     print(
