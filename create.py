@@ -16,8 +16,8 @@ import numpy as np
 SAMPLE_RADIUS = 3  # pixel radius to sample around each cell center
 WHITE_THRESH = 230  # threshold for white cell detection
 COLOR_DIST_THRESH = 2000  # squared distance threshold to consider same color
-OUT_JSON = "init_selection_from_image.json"
-OUT_OVERLAY = "regionsn_overlay.png"
+OUT_JSON = "created/init_selection_from_image.json"
+OUT_OVERLAY = "created/regionsn_overlay.png"
 
 # ------------------ image sampling ------------------
 def sample_grid_colors(img_path: str, w: int, h: int) -> Tuple[List[List[Tuple[int,int,int]]], Tuple[List[int],List[int]], Image.Image]:
