@@ -3,6 +3,7 @@ from collections import deque
 from colorsys import hsv_to_rgb
 from functools import lru_cache
 from io import BytesIO
+from multiprocessing import Manager, Pool, cpu_count
 from os import makedirs, path
 from random import Random, random
 from time import perf_counter
@@ -11,8 +12,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageDraw
 
-from polyominoes import ominoes_dict
 from big_polyominoes import big_ominoes_dict
+from polyominoes import ominoes_dict
 
 # ---------------------- constantes ----------------------
 _ROTATIONS = (
@@ -183,11 +184,12 @@ def placements_for_shape(
     else:
         canonical = tuple(shape)
     syms = all_symmetries(canonical)
-    
+
     # OTIMIZAÇÃO: Pré-filtrar simetrias que não cabem no tabuleiro
-    syms_filtered = [s for s in syms 
-                    if max(x for x, _ in s) < w and max(y for _, y in s) < h]
-    
+    syms_filtered = [
+        s for s in syms if max(x for x, _ in s) < w and max(y for _, y in s) < h
+    ]
+
     placements = []
     seen_masks = set()
     app = placements.append
@@ -525,7 +527,7 @@ def neighbor_move(
     N = len(placements)
     choice = rng.random()
     chosen_set = set(chosen)
-    
+
     # ADD MOVE
     if choice < 0.35 and len(chosen) < max_pieces:
         pool = list(range(N))
@@ -543,7 +545,7 @@ def neighbor_move(
             new_occ = occ | pl["mask"]
             new_used = used_shapes | (1 << sid)  # ← atualização incremental
             return new_chosen, new_occ, new_used
-    
+
     # REMOVE MOVE
     if choice < 0.7 and len(chosen) > 0:
         rem = rng.choice(chosen)
@@ -555,7 +557,7 @@ def neighbor_move(
             new_occ |= placements[c]["mask"]
             new_used |= 1 << placements[c]["shape_id"]
         return new_chosen, new_occ, new_used
-    
+
     # SWAP MOVE
     if len(chosen) > 0:
         rem = rng.choice(chosen)
@@ -580,7 +582,7 @@ def neighbor_move(
             new_occ2 = occ_tmp | pl["mask"]
             new_used2 = used_tmp | (1 << sid)
             return new_chosen2, new_occ2, new_used2
-    
+
     # Fallback
     if len(chosen) > 0:
         rem = rng.choice(chosen)
@@ -591,7 +593,7 @@ def neighbor_move(
             new_occ |= placements[c]["mask"]
             new_used |= 1 << placements[c]["shape_id"]
         return new_chosen, new_occ, new_used
-    
+
     return chosen, occ, used_shapes
 
 
@@ -733,7 +735,244 @@ def render_maze_and_path_by_shape(
             raise
 
 
-# ---------------------- heuristic optimizer (OTIMIZADO) ----------------------
+# ============================================================================
+# PARALLEL WORKER FUNCTIONS
+# ============================================================================
+
+
+def _optimize_worker(args):
+    """
+    Worker function para paralelizar optimize_maze.
+    Cada worker roda uma cadeia independente de simulated annealing.
+    """
+    (
+        worker_id,
+        placements,
+        w,
+        h,
+        max_pieces,
+        no_repeat,
+        time_limit,
+        seed_base,
+        out_prefix,
+        cell,
+        first_greedy,
+        shared_best_score,
+        max_no_improve,
+    ) = args
+
+    # Seed único para cada worker
+    seed = seed_base + worker_id if seed_base is not None else None
+    # trunk-ignore(bandit/B311)
+    rng = Random(seed)
+    start_time = perf_counter()
+
+    local_best_sel = None
+    local_best_occ = 0
+    local_best_score = -1
+    local_best_path = []
+
+    # Inicialização greedy
+    for _ in range(first_greedy):
+        sel, occ = random_feasible_selection(placements, max_pieces, no_repeat, rng)
+        score, _, _, path = score_selection(occ, w, h)
+        if score > local_best_score:
+            local_best_score = score
+            local_best_sel, local_best_occ, local_best_path = sel, occ, path
+
+    if local_best_sel is None:
+        local_best_sel = []
+        local_best_occ = 0
+        local_best_path = []
+        local_best_score = 0
+
+    current_sel = local_best_sel.copy() if local_best_sel else []
+    current_occ = local_best_occ
+    current_score = local_best_score
+
+    # Manter used_shapes como estado
+    current_used = 0
+    for i in current_sel:
+        current_used |= 1 << placements[i]["shape_id"]
+
+    T0 = 1.0
+    Tmin = 0.001
+    step = 0
+    no_improve_steps = 0
+    last_best_step = 0
+
+    while perf_counter() - start_time < time_limit:
+        step += 1
+        sel2, occ2, used2 = neighbor_move(
+            current_sel.copy(),
+            current_occ,
+            current_used,
+            placements,
+            max_pieces,
+            no_repeat,
+            rng,
+        )
+        sc2, _, _, path2 = score_selection(occ2, w, h)
+        accept = False
+        if sc2 > current_score:
+            accept = True
+        else:
+            frac = (perf_counter() - start_time) / max(1.0, time_limit)
+            T = T0 * (1 - frac) + Tmin * frac
+            delta = sc2 - current_score
+            if delta >= 0:
+                prob = 1.0
+            else:
+                prob = min(1.0, (2.718281828459045 ** (delta / max(1e-6, T))))
+            if rng.random() < prob:
+                accept = True
+
+        if accept:
+            current_sel = sel2
+            current_occ = occ2
+            current_score = sc2
+            current_used = used2
+
+            if sc2 > local_best_score:
+                local_best_score = sc2
+                local_best_sel = sel2.copy()
+                local_best_occ = occ2
+                local_best_path = path2
+                last_best_step = step
+                no_improve_steps = 0
+            else:
+                no_improve_steps = step - last_best_step
+        else:
+            no_improve_steps = step - last_best_step
+
+        # Early stopping
+        if no_improve_steps >= max_no_improve:
+            break
+
+    return (
+        worker_id,
+        local_best_score,
+        local_best_sel,
+        local_best_occ,
+        local_best_path,
+        step,
+    )
+
+
+# ---------------------- PARALLEL heuristic optimizer ----------------------
+def optimize_maze_parallel(
+    placements: List[Dict[str, Any]],
+    w: int,
+    h: int,
+    max_pieces: int = 8,
+    no_repeat: bool = True,
+    time_limit: Optional[float] = 30,
+    seed: int | None = None,
+    init_selection: List[int] | None = None,
+    init_placement: int | None = None,
+    out: str = "best.png",
+    cell: int = 30,
+    first_greedy: int = 100,
+    n_workers: Optional[int] = None,
+    max_no_improve: int = 5000,
+) -> Tuple[int, List[int], int, List[int]]:
+    """
+    VERSÃO PARALELA de optimize_maze usando múltiplas cadeias independentes.
+
+    Cada worker roda sua própria cadeia de simulated annealing em paralelo.
+    No final, retorna o melhor resultado entre todos os workers.
+
+    Args:
+        n_workers: Número de processos paralelos. Se None, usa cpu_count().
+    """
+    if time_limit is None:
+        time_limit = float("inf")
+
+    if n_workers is None:
+        n_workers = cpu_count()
+
+    n_workers = max(1, min(n_workers, cpu_count()))  # Limitar ao número de CPUs
+
+    print(f"[parallel optimize] Using {n_workers} workers, time_limit={time_limit}s")
+
+    # Se init_selection ou init_placement estão definidos, usar modo sequencial
+    if init_selection or init_placement:
+        print(
+            "[parallel optimize] init_selection/init_placement set, using sequential mode"
+        )
+        return optimize_maze(
+            placements,
+            w,
+            h,
+            max_pieces,
+            no_repeat,
+            time_limit,
+            seed,
+            init_selection,
+            init_placement,
+            out,
+            cell,
+            first_greedy,
+            max_no_improve,
+        )
+
+    start_time = perf_counter()
+
+    # Manager para compartilhar best score (não usado atualmente, mas disponível)
+    manager = Manager()
+    shared_best = manager.Value("i", -1)
+
+    # Preparar argumentos para workers
+    worker_args = []
+    for worker_id in range(n_workers):
+        args = (
+            worker_id,
+            placements,
+            w,
+            h,
+            max_pieces,
+            no_repeat,
+            time_limit,
+            seed,
+            out,
+            cell,
+            first_greedy // n_workers + 1,  # Dividir first_greedy entre workers
+            shared_best,
+            max_no_improve,
+        )
+        worker_args.append(args)
+
+    # Executar workers em paralelo
+    print(f"[parallel optimize] Starting {n_workers} parallel chains...")
+    with Pool(n_workers) as pool:
+        results = pool.map(_optimize_worker, worker_args)
+
+    # Encontrar o melhor resultado
+    best_result = max(results, key=lambda x: x[1])  # x[1] é o score
+    worker_id, best_score, best_sel, best_occ, best_path, steps = best_result
+
+    elapsed = perf_counter() - start_time
+    total_steps = sum(r[5] for r in results)
+
+    print(f"[parallel optimize] Finished in {elapsed:.1f}s")
+    print(f"  Best from worker {worker_id}: score={best_score}, pieces={len(best_sel)}")
+    print(f"  Total steps across all workers: {total_steps}")
+    print(f"  Average steps per worker: {total_steps/n_workers:.0f}")
+
+    # Renderizar melhor resultado
+    if best_sel:
+        try:
+            render_maze_and_path_by_shape(
+                placements, best_sel, w, h, best_path, out_file=out, cell=cell
+            )
+        # trunk-ignore(bandit/B110)
+        except Exception:
+            pass
+
+    return best_score, best_sel, best_occ, best_path
+
+
+# Fallback para modo sequencial
 def optimize_maze(
     placements: List[Dict[str, Any]],
     w: int,
@@ -749,6 +988,7 @@ def optimize_maze(
     first_greedy: int = 100,
     max_no_improve: int = 10000,
 ) -> Tuple[int, List[int], int, List[int]]:
+    """Versão sequencial original (mantida para compatibilidade)."""
     if time_limit is None:
         time_limit = float("inf")
     # trunk-ignore(bandit/B311)
@@ -828,9 +1068,10 @@ def optimize_maze(
             if score > best_score:
                 best_score = score
                 best_sel, best_occ, best_path = sel, occ, path
-                print(
-                    f"[seed {attempt+1}] best score={best_score}, pieces={len(best_sel)} (t={perf_counter()-start_time:.1f}s)"
-                )
+                if attempt % 20 == 0:
+                    print(
+                        f"[seed {attempt+1}] best score={best_score}, pieces={len(best_sel)} (t={perf_counter()-start_time:.1f}s)"
+                    )
         if best_sel is None:
             best_sel = []
             best_occ = 0
@@ -844,7 +1085,7 @@ def optimize_maze(
     current_sel = best_sel.copy() if best_sel else []
     current_occ = best_occ
     current_score = best_score
-    
+
     # OTIMIZAÇÃO: manter used_shapes como estado persistente
     current_used = 0
     for i in current_sel:
@@ -853,17 +1094,21 @@ def optimize_maze(
     T0 = 1.0
     Tmin = 0.001
     step = 0
-    
+
     # OTIMIZAÇÃO: Parâmetros de early stopping
     no_improve_steps = 0
     last_best_step = 0
 
     while perf_counter() - start_time < time_limit:
         step += 1
-        # OTIMIZADO: passar e receber used_shapes
         sel2, occ2, used2 = neighbor_move(
-            current_sel.copy(), current_occ, current_used,
-            placements, max_pieces, no_repeat, rng
+            current_sel.copy(),
+            current_occ,
+            current_used,
+            placements,
+            max_pieces,
+            no_repeat,
+            rng,
         )
         sc2, _, _, path2 = score_selection(occ2, w, h)
         accept = False
@@ -887,7 +1132,7 @@ def optimize_maze(
             current_sel = sel2
             current_occ = occ2
             current_score = sc2
-            current_used = used2  # OTIMIZADO: manter estado
+            current_used = used2
 
             if sc2 > best_score:
                 best_score = sc2
@@ -895,7 +1140,7 @@ def optimize_maze(
                 best_occ = occ2
                 best_path = path2
                 last_best_step = step
-                no_improve_steps = 0  # reset
+                no_improve_steps = 0
                 tnow = perf_counter()
                 print(
                     f"[{step}] New best: diameter={best_score}, pieces={len(best_sel)} (t={tnow-start_time:.1f}s)"
@@ -911,19 +1156,337 @@ def optimize_maze(
                 no_improve_steps = step - last_best_step
         else:
             no_improve_steps = step - last_best_step
-        
-        # OTIMIZAÇÃO: Early stopping
+
         if no_improve_steps >= max_no_improve:
             print(f"[early stop] no improvement in {no_improve_steps} steps")
             break
-            
+
     print(
         f"[done] elapsed={perf_counter()-start_time:.1f}s steps={step} best_score={best_score} pieces={0 if not best_sel else len(best_sel)}"
     )
     return best_score, best_sel, best_occ, best_path
 
 
-# ---------------------- brute-force search (OTIMIZADO com memoization) ----------------------
+# ============================================================================
+# PARALLEL BRUTEFORCE WORKER FUNCTIONS
+# ============================================================================
+def _bruteforce_worker(args):
+    """
+    Worker function para paralelizar bruteforce_search.
+    Cada worker explora um subset do espaço de busca.
+    """
+    (
+        worker_id,
+        start_idx,
+        end_idx,
+        placements,
+        w,
+        h,
+        max_pieces,
+        no_repeat,
+        time_limit,
+        order,
+        masks,
+        maps,
+        total,
+        shared_best_score,
+        shared_lock,
+    ) = args
+
+    start_time = perf_counter()
+
+    local_best_score = -1
+    local_best_sel = []
+    local_best_occ = 0
+    local_best_path = []
+
+    nodes_visited = 0
+    time_up = False
+    seen_canons = set()
+    state_memo = {}
+    pruned_by_memo = 0
+
+    # Cache de canonização
+    @lru_cache(maxsize=None)
+    def canonical_mask_cached(mask: int) -> int:
+        best = None
+        for mapping in maps:
+            m = mask
+            res = 0
+            while m:
+                lsb = m & -m
+                idx = lsb.bit_length() - 1
+                res |= 1 << mapping[idx]
+                m &= m - 1
+            if best is None or res < best:
+                best = res
+        return best if best is not None else mask
+
+    def dfs(i, sel, occ, used_shapes):
+        nonlocal local_best_score, local_best_sel, local_best_occ, local_best_path
+        nonlocal nodes_visited, time_up, pruned_by_memo
+
+        if perf_counter() - start_time > time_limit:
+            time_up = True
+            return
+
+        nodes_visited += 1
+
+        # Memoization
+        canon = canonical_mask_cached(occ)
+        n_pieces = len(sel)
+        state_key = (canon, n_pieces)
+
+        # Verificar contra best global (thread-safe read)
+        with shared_lock:
+            current_global_best = shared_best_score.value
+
+        if state_key in state_memo:
+            if state_memo[state_key] <= max(local_best_score, current_global_best):
+                pruned_by_memo += 1
+                return
+
+        # Evaluate
+        score, _, _, path = score_selection(occ, w, h)
+
+        # Atualizar memo
+        if state_key not in state_memo or state_memo[state_key] < score:
+            state_memo[state_key] = score
+
+        if score > local_best_score:
+            local_best_score = score
+            local_best_sel = sel.copy()
+            local_best_occ = occ
+            local_best_path = path
+
+            # Atualizar global best se necessário
+            with shared_lock:
+                if score > shared_best_score.value:
+                    shared_best_score.value = score
+
+        # Upper bound prune
+        blocked = occ.bit_count()
+        empty_cells = total - blocked
+        if empty_cells <= 1 or (empty_cells - 1) <= max(
+            local_best_score, current_global_best
+        ):
+            return
+
+        if len(sel) >= max_pieces or i >= len(order):
+            return
+
+        # Canonical pruning
+        if canon in seen_canons:
+            return
+        seen_canons.add(canon)
+
+        # Explore
+        for k in range(i, len(order)):
+            if time_up:
+                break
+            idx = order[k]
+            pl = placements[idx]
+            sid = pl["shape_id"]
+            mask = masks[idx]
+
+            if occ & mask:
+                continue
+            if no_repeat and ((used_shapes >> sid) & 1):
+                continue
+
+            sel.append(idx)
+            dfs(k + 1, sel, occ | mask, used_shapes | (1 << sid))
+            sel.pop()
+
+            if time_up:
+                break
+
+    # Explorar apenas placements no range [start_idx, end_idx)
+    for start_placement_idx in range(start_idx, end_idx):
+        if time_up:
+            break
+
+        idx = order[start_placement_idx]
+        pl = placements[idx]
+        occ = pl["mask"]
+        used = 1 << pl["shape_id"] if no_repeat else 0
+        sel = [idx]
+
+        dfs(start_placement_idx + 1, sel, occ, used)
+
+    elapsed = perf_counter() - start_time
+    return (
+        worker_id,
+        local_best_score,
+        local_best_sel,
+        local_best_occ,
+        local_best_path,
+        nodes_visited,
+        pruned_by_memo,
+        elapsed,
+    )
+
+
+# ---------------------- PARALLEL brute-force search ----------------------
+def bruteforce_search_parallel(
+    placements: List[Dict[str, Any]],
+    w: int,
+    h: int,
+    max_pieces: int = 8,
+    no_repeat: bool = True,
+    time_limit: Optional[float] = None,
+    out: str = "brute_best.png",
+    cell: int = 30,
+    n_workers: Optional[int] = None,
+):
+    """
+    VERSÃO PARALELA de bruteforce_search.
+
+    Divide o espaço de busca entre múltiplos workers que exploram em paralelo.
+    Cada worker começa com um subset diferente de placements iniciais.
+
+    Args:
+        n_workers: Número de processos paralelos. Se None, usa cpu_count().
+    """
+    if time_limit is None:
+        time_limit = float("inf")
+
+    if n_workers is None:
+        n_workers = cpu_count()
+
+    n_workers = max(1, min(n_workers, cpu_count()))
+
+    start_time = perf_counter()
+
+    N = len(placements)
+    total = w * h
+
+    print(f"[parallel brute] Using {n_workers} workers for {N} placements")
+
+    # Precompute
+    masks = [p["mask"] for p in placements]
+
+    # Shape frequency
+    max_shape_id = max((p["shape_id"] for p in placements), default=-1)
+    shape_freq = [0] * (max_shape_id + 1)
+    for p in placements:
+        shape_freq[p["shape_id"]] += 1
+
+    # Overlap count
+    overlap_count = [0] * N
+    for i in range(N):
+        mi = masks[i]
+        cnt = sum(1 for j in range(N) if i != j and (mi & masks[j]))
+        overlap_count[i] = cnt
+
+    # Order placements
+    order = list(range(N))
+    order.sort(
+        key=lambda i: (
+            shape_freq[placements[i]["shape_id"]],
+            -overlap_count[i],
+            placements[i]["shape_id"],
+            -masks[i].bit_count(),
+        )
+    )
+
+    # Build symmetry maps
+    def valid_transforms():
+        trans = []
+        trans.append(("id", lambda x, y: (x, y)))
+        trans.append(("rot180", lambda x, y: (w - 1 - x, h - 1 - y)))
+        trans.append(("flip_x", lambda x, y: (w - 1 - x, y)))
+        trans.append(("flip_y", lambda x, y: (x, h - 1 - y)))
+        if w == h:
+            trans.append(("rot90", lambda x, y: (y, w - 1 - x)))
+            trans.append(("rot270", lambda x, y: (h - 1 - y, x)))
+            trans.append(("diag", lambda x, y: (y, x)))
+            trans.append(("antidiag", lambda x, y: (h - 1 - y, w - 1 - x)))
+        return trans
+
+    trans_funcs = valid_transforms()
+    maps = []
+    for _, f in trans_funcs:
+        mapping = [0] * total
+        ok = True
+        for idx in range(total):
+            x = idx % w
+            y = idx // w
+            nx, ny = f(x, y)
+            if not (0 <= nx < w and 0 <= ny < h):
+                ok = False
+                break
+            mapping[idx] = ny * w + nx
+        if ok:
+            maps.append(tuple(mapping))
+
+    # Manager para compartilhar best score
+    manager = Manager()
+    shared_best_score = manager.Value("i", -1)
+    shared_lock = manager.Lock()
+
+    # Dividir espaço de busca
+    chunk_size = max(1, N // n_workers)
+    worker_args = []
+
+    for worker_id in range(n_workers):
+        start_idx = worker_id * chunk_size
+        end_idx = min(start_idx + chunk_size, N) if worker_id < n_workers - 1 else N
+
+        args = (
+            worker_id,
+            start_idx,
+            end_idx,
+            placements,
+            w,
+            h,
+            max_pieces,
+            no_repeat,
+            time_limit,
+            order,
+            masks,
+            maps,
+            total,
+            shared_best_score,
+            shared_lock,
+        )
+        worker_args.append(args)
+
+    # Executar workers
+    print(f"[parallel brute] Starting {n_workers} parallel branches...")
+    with Pool(n_workers) as pool:
+        results = pool.map(_bruteforce_worker, worker_args)
+
+    # Combinar resultados
+    best_result = max(results, key=lambda x: x[1])
+    worker_id, best_score, best_sel, best_occ, best_path, nodes, memo_prunes, _ = (
+        best_result
+    )
+
+    total_nodes = sum(r[5] for r in results)
+    total_memo_prunes = sum(r[6] for r in results)
+    elapsed = perf_counter() - start_time
+
+    print(f"[parallel brute] Finished in {elapsed:.2f}s")
+    print(f"  Best from worker {worker_id}: score={best_score}, pieces={len(best_sel)}")
+    print(f"  Total nodes visited: {total_nodes}")
+    print(f"  Total memo prunes: {total_memo_prunes}")
+    print(f"  Average nodes per worker: {total_nodes/n_workers:.0f}")
+
+    # Renderizar melhor
+    if best_sel:
+        try:
+            render_maze_and_path_by_shape(
+                placements, best_sel, w, h, best_path, out_file=out, cell=cell
+            )
+        # trunk-ignore(bandit/B110)
+        except Exception:
+            pass
+
+    return best_score, best_sel, best_occ, best_path
+
+
+# Fallback sequencial para bruteforce
 def bruteforce_search(
     placements: List[Dict[str, Any]],
     w: int,
@@ -934,6 +1497,7 @@ def bruteforce_search(
     out: str = "brute_best.png",
     cell: int = 30,
 ):
+    """Versão sequencial (mantida para compatibilidade)."""
     if time_limit is None:
         time_limit = float("inf")
     start_time = perf_counter()
@@ -956,7 +1520,7 @@ def bruteforce_search(
     for p in placements:
         shape_freq[p["shape_id"]] += 1
 
-    # overlap count (O(N^2) — kept, could be improved if needed)
+    # overlap count
     overlap_count = [0] * N
     for i in range(N):
         mi = masks[i]
@@ -966,7 +1530,7 @@ def bruteforce_search(
                 cnt += 1
         overlap_count[i] = cnt
 
-    # order placements: rarer shapes first, then more overlapping, then shape id, then bigger popcount
+    # order placements
     order = list(range(N))
     order.sort(
         key=lambda i: (
@@ -977,7 +1541,7 @@ def bruteforce_search(
         )
     )
 
-    # ---------- build board symmetry index maps ----------
+    # build board symmetry index maps
     def valid_transforms():
         trans = []
         trans.append(("id", lambda x, y: (x, y)))
@@ -1007,18 +1571,15 @@ def bruteforce_search(
         if ok:
             maps.append(mapping)
 
-    # small micro-opt: convert maps to tuple-of-tuples to be hashable if necessary
     maps = [tuple(m) for m in maps]
 
-    # ---------- caching canonicalization ----------
+    # caching canonicalization
     @lru_cache(maxsize=None)
     def canonical_mask_cached(mask: int) -> int:
-        # same logic as canonical_mask but cached
         best = None
         for mapping in maps:
             m = mask
             res = 0
-            # iterate set bits
             while m:
                 lsb = m & -m
                 idx = lsb.bit_length() - 1
@@ -1028,16 +1589,13 @@ def bruteforce_search(
                 best = res
         return best if best is not None else mask
 
-    # ---------- DFS with canonical-pruning, upper-bound pruning, and MEMOIZATION ----------
     nodes_visited = 0
     time_up = False
     seen_canons = set()
-    
-    # OTIMIZAÇÃO: Memoization de estados
+
     state_memo = {}
     pruned_by_memo = 0
 
-    # local bindings for speed in inner loop
     masks_local = masks
     placements_local = placements
     order_local = order
@@ -1048,38 +1606,31 @@ def bruteforce_search(
         nonlocal best_score, best_sel, best_occ, best_path, nodes_visited
         nonlocal time_up, pruned_by_memo
 
-        # inline time check (cheap)
         if perf() - start_time > time_limit:
             time_up = True
             return
 
         nodes_visited += 1
-        
-        # OTIMIZAÇÃO: Memoization check
+
         canon = canonical_mask_cached(occ)
         n_pieces = len(sel)
         state_key = (canon, n_pieces)
-        
+
         if state_key in state_memo:
-            # Se já exploramos esse estado com mesmo número de peças
-            # e não achamos nada melhor que o atual best, podar
             if state_memo[state_key] <= best_score:
                 pruned_by_memo += 1
                 return
 
-        # Evaluate current subset
         score, _, _, path = score_selection(occ, w, h)
-        
-        # OTIMIZAÇÃO: Atualizar memo
+
         if state_key not in state_memo or state_memo[state_key] < score:
             state_memo[state_key] = score
-        
+
         if score > best_score:
             best_score = score
             best_sel = sel.copy()
             best_occ = occ
             best_path = path
-            # log + optional render (kept)
             print(
                 f"[brute] new best score={best_score} pieces={len(best_sel)}, nodes={nodes_visited}, "
                 f"memo_prunes={pruned_by_memo} (t={perf()-start_time:.2f}s)"
@@ -1092,22 +1643,18 @@ def bruteforce_search(
             except Exception:
                 pass
 
-        # quick upper-bound prune: maximum possible diameter from here is (empty_cells - 1)
         blocked = occ.bit_count()
         empty_cells = total_local - blocked
         if empty_cells <= 1 or (empty_cells - 1) <= best_score:
             return
 
-        # stop deeper inclusion if reached piece limit or consumed all placements
         if len(sel) >= max_pieces or i >= N:
             return
 
-        # canonical pruning: only expand canonical occupancy once
         if canon in seen_canons:
             return
         seen_canons.add(canon)
 
-        # try including further placements
         for k in range(i, N):
             if time_up:
                 break
@@ -1128,7 +1675,6 @@ def bruteforce_search(
             if time_up:
                 break
 
-    # start DFS
     print(
         f"[brute] starting exhaustive search with memoization: placements={N} max_pieces={max_pieces} "
         f"time_limit={time_limit if time_limit!=float('inf') else 'Infinity'} s"
@@ -1162,7 +1708,17 @@ def main() -> None:
     p.add_argument("--init-selection", type=str, default=None)
     p.add_argument("--max-no-improve", type=int, default=10000)
     # brute-force control
-    p.add_argument("--bruteforce", action="store_true", help="force exhaustive bruteforce")
+    p.add_argument(
+        "--bruteforce", action="store_true", help="force exhaustive bruteforce"
+    )
+    # NOVO: controle de paralelização
+    p.add_argument("--parallel", action="store_true", help="enable parallel execution")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="number of parallel workers (default: cpu_count)",
+    )
     args = p.parse_args()
 
     no_repeat = True if not args.allow_repeat else False
@@ -1196,38 +1752,77 @@ def main() -> None:
     placements = build_global_placements(shapes, args.w, args.h)
     print("Total placements:", len(placements))
 
-    # decide mode: bruteforce or heuristic
-    allow_bruteforce = args.bruteforce
+    # decide mode
+    use_parallel = args.parallel
+    n_workers = args.workers
 
-    if allow_bruteforce:
-        print("[mode] using exhaustive bruteforce search (OPTIMIZED)")
-        best_score, best_sel, _, best_path = bruteforce_search(
-            placements,
-            args.w,
-            args.h,
-            max_pieces=args.max_pieces,
-            no_repeat=no_repeat,
-            time_limit=args.time_limit,
-            out=args.out,
-            cell=args.cell,
-        )
+    if args.bruteforce:
+        if use_parallel:
+            print(
+                f"[mode] using PARALLEL bruteforce search (workers={n_workers if n_workers else 'auto'})"
+            )
+            best_score, best_sel, _, best_path = bruteforce_search_parallel(
+                placements,
+                args.w,
+                args.h,
+                max_pieces=args.max_pieces,
+                no_repeat=no_repeat,
+                time_limit=args.time_limit,
+                out=args.out,
+                cell=args.cell,
+                n_workers=n_workers,
+            )
+        else:
+            print("[mode] using sequential bruteforce search")
+            best_score, best_sel, _, best_path = bruteforce_search(
+                placements,
+                args.w,
+                args.h,
+                max_pieces=args.max_pieces,
+                no_repeat=no_repeat,
+                time_limit=args.time_limit,
+                out=args.out,
+                cell=args.cell,
+            )
     else:
-        print("[mode] using heuristic optimize_maze (OPTIMIZED)")
-        best_score, best_sel, _, best_path = optimize_maze(
-            placements,
-            args.w,
-            args.h,
-            max_pieces=args.max_pieces,
-            no_repeat=no_repeat,
-            time_limit=args.time_limit,
-            seed=args.seed,
-            init_selection=init_selection,
-            init_placement=init_placement,
-            out=args.out,
-            cell=args.cell,
-            first_greedy=args.first_greedy,
-            max_no_improve=args.max_no_improve,
-        )
+        if use_parallel:
+            print(
+                f"[mode] using PARALLEL heuristic search (workers={n_workers if n_workers else 'auto'})"
+            )
+            best_score, best_sel, _, best_path = optimize_maze_parallel(
+                placements,
+                args.w,
+                args.h,
+                max_pieces=args.max_pieces,
+                no_repeat=no_repeat,
+                time_limit=args.time_limit,
+                seed=args.seed,
+                init_selection=init_selection,
+                init_placement=init_placement,
+                out=args.out,
+                cell=args.cell,
+                first_greedy=args.first_greedy,
+                n_workers=n_workers,
+                max_no_improve=(
+                    args.max_no_improve if args.max_no_improve > 0 else float("inf")
+                ),
+            )
+        else:
+            print("[mode] using sequential heuristic search")
+            best_score, best_sel, _, best_path = optimize_maze(
+                placements,
+                args.w,
+                args.h,
+                max_pieces=args.max_pieces,
+                no_repeat=no_repeat,
+                time_limit=args.time_limit,
+                seed=args.seed,
+                init_selection=init_selection,
+                init_placement=init_placement,
+                out=args.out,
+                cell=args.cell,
+                first_greedy=args.first_greedy,
+            )
 
     print(
         "BEST diameter:",
